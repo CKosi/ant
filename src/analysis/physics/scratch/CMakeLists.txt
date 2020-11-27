@@ -20,3 +20,9 @@ add_ant_physics(wagner/MCGunChecks.cc)
 
 add_ant_physics(wettig/CBEfficiencyCheck.cc)
 
+add_ant_physics(damaurer/MC_ppi0_pgg.cc)
+add_ant_physics(damaurer/Tutorial_kinFit.cc)
+add_ant_physics(damaurer/MC_pw_ppi0g_p3g.cc)
+add_ant_physics(damaurer/pw_ppi0g_p3g_kinFit.cc)
+
+add_ant_physics(ckosi/pg_ppi0_pgg.cc)
