@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <numeric>
 #include <sstream>
 #include <cassert>
 #include <fstream>
@@ -19,6 +20,7 @@
 #include "base/WrapTFile.h"
 #include "base/std_ext/string.h"
 #include "base/std_ext/system.h"
+#include "base/std_ext/math.h"
 #include "base/ParticleType.h"
 
 #include "analysis/plot/RootDraw.h"
@@ -29,6 +31,7 @@
 
 #include "TH1D.h"
 #include "TH2D.h"
+#include "TF1.h"
 #include "TCanvas.h"
 #include "TPaveText.h"
 #include "TPaveStats.h"
@@ -39,6 +42,8 @@
 #include "TRint.h"
 #include "TROOT.h"
 #include "TStyle.h"
+#include "TFrame.h"
+#include "TLegend.h"
 
 #include "RooRealVar.h"
 #include "RooConstVar.h"
@@ -61,6 +66,7 @@
 #include "RooFitResult.h"
 
 #include "detail/tools.h"
+#include "detail/Corrections.h"
 
 
 namespace fs = std::filesystem;
@@ -68,6 +74,7 @@ namespace fs = std::filesystem;
 using namespace ant;
 using namespace std;
 using namespace RooFit;
+using namespace ant::progs::corrections;
 
 using q2_params_t = ant::analysis::physics::EtapDalitzTools::q2_params_t;
 
@@ -136,6 +143,7 @@ struct settings_t final
     static settings_t& get();
 
     bool debug;
+    bool corrections;
     int rebin;
     fs::path out_dir;
 
@@ -375,7 +383,7 @@ void save_pad(const T* const p, const fs::path& output_dir, const string& filena
 }
 
 void reference_fit(const WrapTFileInput& input, const string& cuts, const vector<int>& EPTrange,
-                   const WrapTFileInput& mc)
+                   const WrapTFileInput& mc, pair<double, double>& result)
 {
     settings_t& settings = settings_t::get();
 
@@ -601,7 +609,8 @@ void reference_fit(const WrapTFileInput& input, const string& cuts, const vector
         results.emplace_back(move(res));
     }
 
-    LOG(INFO) << "Total number of eta': " << total_number_etap << " +/- " << sqrt(total_n_err);
+    result = {total_number_etap, sqrt(total_n_err)};
+    LOG(INFO) << "Total number of eta': " << result.first << " +/- " << result.second;
 
     c_N.cd();
     save_pad(gPad, settings.out_dir, "ref_Netap_vs_Eg.pdf");
@@ -679,9 +688,9 @@ void reference_fit(const WrapTFileInput& input, const string& cuts, const vector
     VLOG(1) << "Used Iterations: " << aplcon_res.NIterations << "; Fit Probability: " << aplcon_res.Probability;
 }
 
-vector<string> build_q2_histnames()
+vector<IntervalD> get_q2_ranges()
 {
-    vector<string> hist_names;
+    vector<IntervalD> q2_ranges;
 
     double bin_start = q2_params_t::min_value;
     auto it = q2_params_t::bin_widths.begin();
@@ -694,13 +703,24 @@ vector<string> build_q2_histnames()
             throw runtime_error("Not enough bins provided");
         }
 
-        // create the histogram names of the bins
         double q2 = bin_start + *it++;
-        stringstream name;
-        name << "imee_" << bin_start << "_" << q2;
-        hist_names.emplace_back(name.str());
+        q2_ranges.emplace_back(bin_start, q2);
 
         bin_start = q2;
+    }
+
+    return q2_ranges;
+}
+
+vector<string> build_q2_histnames()
+{
+    vector<IntervalD> q2_ranges = get_q2_ranges();
+    vector<string> hist_names;
+
+    for (auto range : q2_ranges) {
+        stringstream name;
+        name << "imee_" << range.Start() << "_" << range.Stop();
+        hist_names.emplace_back(name.str());
     }
 
     return hist_names;
@@ -708,8 +728,8 @@ vector<string> build_q2_histnames()
 
 // some static declarations to control the signal fits, not ideal this way
 // TODO: rewrite this in a proper way without globally defined static objects
-static constexpr interval<double> exclude_range = {950, 970};
-static constexpr interval<double> default_fit_range = {840, 1020};
+static constexpr IntervalD exclude_range = {950, 970};
+static constexpr IntervalD default_fit_range = {840, 1020};
 static TF1* signal_bg = nullptr;
 
 double bkg_fun(double* x, double* par)
@@ -770,15 +790,14 @@ TH1* subtract_bkg(const TH1* const h, TF1* const f)
 }
 
 void signal_fit(const WrapTFileInput& input, const vector<vector<string>>& cuts, const vector<unsigned>& imee_bins,
-                const WrapTFileInput& mc)
+                const WrapTFileInput& mc, const WrapTFileInput& mcplot, vector<pair<double, double>>& signal_fits)
 {
     settings_t& settings = settings_t::get();
 
     auto hist_names = build_q2_histnames();
     LOG(INFO) << "size: " << hist_names.size() << "; contents:  " << hist_names;
 
-    const auto debug = el::Loggers::verboseLevel();
-    if (debug)
+    if (settings.debug)
         cout << "Constructed q2 histogram names: " << hist_names << endl;
 
     if (cuts.empty())
@@ -815,7 +834,7 @@ void signal_fit(const WrapTFileInput& input, const vector<vector<string>>& cuts,
     for (auto i : q2_bins_cuts)
         cout << "hist " << i.q2_bin << " will use the cut " << i.cut_string << endl;
 
-    if (debug)
+    if (settings.debug)
         for (const auto& i : imee_bins)
             cout << "use bin " << i << " (" << q2_bins_cuts.at(i).q2_bin << ")" << endl;
 
@@ -853,6 +872,8 @@ void signal_fit(const WrapTFileInput& input, const vector<vector<string>>& cuts,
         {920, 1000}
     };
 
+    vector<pair<double, double>> imee_fits;
+
 
     const string tree_name = "EtapDalitz_plot_Sig";
 
@@ -861,7 +882,7 @@ void signal_fit(const WrapTFileInput& input, const vector<vector<string>>& cuts,
     TCanvas *c1 = new TCanvas("c1", "Background Fit", 10, 10, 1000, 800);
     TCanvas *c2 = new TCanvas("c2", "Background Subtraction", 1010, 10, 1000, 800);
 
-    const char* default_fit_options = debug ? "R0" : "R0Q";  // R use specified function range, 0 do not plot fit result, Q quiet mode
+    const char* default_fit_options = settings.debug ? "R0" : "R0Q";  // R use specified function range, 0 do not plot fit result, Q quiet mode
 
     for (auto bin : imee_bins) {
 
@@ -949,6 +970,7 @@ void signal_fit(const WrapTFileInput& input, const vector<vector<string>>& cuts,
     sgnl->SetLineColor(kRed+1);
     sgnl->Draw("SAME");
     LOG(INFO) << "Fitted number of signal events for bin " << q2_hist << ": " << sgnl->GetParameter(0) << " +/- " << sgnl->GetParError(0);
+    imee_fits.emplace_back(sgnl->GetParameter(0), sgnl->GetParError(0));
     // only show the fit information on the second canvas
     auto ps = dynamic_cast<TPaveStats*>(c2->GetPrimitive("stats"));
     ps->SetOptFit(111);
@@ -958,6 +980,354 @@ void signal_fit(const WrapTFileInput& input, const vector<vector<string>>& cuts,
     }  // end loop imee_bins
 
 
+
+    // Efficiency Correction
+    // based on the provided files either gather needed values from them or use some default values
+
+    TH1* h_mc = nullptr;
+    const bool hasMC = mc.NumberOfFiles();
+    const bool hasPlotterMC = mcplot.NumberOfFiles();
+
+    // check if MC file provided, if yes get true MC histogram for dilepton mass
+    if (hasMC) {
+        if (!mc.GetObject("EtapDalitzMC/h_IMee_true", h_mc))
+            throw runtime_error("Couldn't find true MC histogram in file " + mc.FileNames());
+    }
+
+    if (!hasMC && !hasPlotterMC)
+        LOG(WARNING) << "No MC input provided, some default values will be used for efficiency corrections";
+    else if (!hasMC)
+        LOG(WARNING) << "No file containing true MC histogram provided, use default values";
+    else if (!hasPlotterMC)
+        LOG(WARNING) << "No Plotter file for MC provided, use default values for reconstructed events";
+
+    // get true signal entries for the q2 bins
+    vector<int> N_true;
+    if (hasMC) {
+        vector<double> bin_edges;  // get lower bin edges to create a variable bin width histogram based on the q2 ranges
+        const auto q2_ranges = get_q2_ranges();
+        transform(q2_ranges.cbegin(), q2_ranges.cend(), back_inserter(bin_edges), [](const IntervalD range){ return range.Start(); });
+        bin_edges.emplace_back(q2_ranges.back().Stop());  // last bin upper edge
+        TH1* h_mc_q2 = h_mc->Rebin(int(q2_ranges.size()), "h_mc_q2", &bin_edges[0]);
+        for (int i = 1; i < h_mc_q2->GetNbinsX(); i++)
+            N_true.emplace_back(h_mc_q2->GetBinContent(i));
+    } else
+        N_true = {1796465, 648784, 443837, 413906, 321715, 266582, 268359, 269363, 273838, 367069, 336559, 301793, 203500, 37855};
+
+    // get reconstructed signal entries for the q2 bins
+    vector<int> N_rec;
+    if (hasPlotterMC)
+        for (auto bin : imee_bins) {
+            TH1* h_mc_rec;
+            auto cut = q2_bins_cuts.at(bin).cut_string;
+            auto q2_hist = q2_bins_cuts.at(bin).q2_bin;
+            auto hist = concat_string({tree_name, cut, "h/Signal", q2_hist}, "/");
+            if (!mcplot.GetObject(hist, h_mc_rec))
+                throw runtime_error("Couldn't find " + hist + " in file " + input.FileNames());
+            N_rec.emplace_back(h_mc_rec->GetEntries());
+        }
+    else
+        N_rec = {44647, 82368, 82391, 76605, 60388, 49237, 51209, 46409, 42275, 53206, 48704, 43092, 27068, 6236};
+
+    // determine efficiencies and apply efficiency corrections
+    for (auto i : imee_bins) {
+        double eff = N_rec.at(i);
+        eff /= N_true.at(i);
+        double eff_err = eff * (1 - eff) / N_true.at(i);
+
+        double corr = imee_fits.at(i).first / eff;
+        double corr_err = 1./eff * sqrt(std_ext::sqr(imee_fits.at(i).second) + std_ext::sqr(imee_fits.at(i).first) * std_ext::sqr(eff_err));
+        signal_fits.emplace_back(corr, corr_err);
+
+        LOG(INFO) << "Efficiency corrected signal events bin " << hist_names.at(i) << ": " << corr << " +/- " << corr_err;
+    }
+    if (el::Loggers::verboseLevel()) {
+        auto sum_pair = [] (double sum, const pair<double, double> n) {
+            return sum + n.first;
+        };
+        LOG(INFO) << "Total number of fitted signal events: " << accumulate(signal_fits.begin(), signal_fits.end(), 0., sum_pair);
+        double N_rec_total = accumulate(N_rec.begin(), N_rec.end(), 0.), N_true_total = accumulate(N_true.begin(), N_true.end(), 0.);
+        LOG(INFO) << "Overall analysis efficiency: " << N_rec_total / N_true_total << "%   (" << N_rec_total << "/" << N_true_total << ")";
+    }
+}
+
+
+#define ALPHA 0.0072973525693
+static constexpr double BR_etap_2g = 0.02307;
+
+// QED description
+Double_t QED(Double_t *mee)
+{
+    const double m_ee = mee[0];
+    const double m_ee_sqr = std_ext::sqr(m_ee);
+    const double m_e_sqr = std_ext::sqr(ParticleTypeDatabase::eMinus.Mass()/1000.);
+    Double_t rmeta = m_ee/(ParticleTypeDatabase::EtaPrime.Mass()/1000.);
+    Double_t rmeta2 = rmeta*rmeta;
+    Double_t drmeta = 1-rmeta2;
+    Double_t drmeta3 = drmeta*drmeta*drmeta;
+    Double_t Gam_qed = 4.*ALPHA*BR_etap_2g/(3.*M_PI*m_ee)*drmeta3;
+    Double_t Gam_qedc = Gam_qed*sqrt(1.-4.*m_e_sqr/m_ee_sqr)*(1.+2.*m_e_sqr/m_ee_sqr);  // constant term and very small, cancels by dividing
+    return Gam_qedc;
+}
+
+// Form Factor parametrization
+Double_t TFF(Double_t *mee, Double_t *par)
+{
+    const double m_ee = mee[0];
+    const double m_ee_sqr = std_ext::sqr(m_ee);
+    const double Lambda_sqr = std_ext::sqr(par[1]);
+    const double gamma_sqr = std_ext::sqr(par[2]);
+    const double VMD = Lambda_sqr * (Lambda_sqr+gamma_sqr) / ( std_ext::sqr(Lambda_sqr - m_ee_sqr) + Lambda_sqr*gamma_sqr );
+    return VMD*par[0];
+}
+
+// dGamma/dm  (QED * TFF)
+Double_t dGdm(Double_t *mee, Double_t *par)
+{
+    const double qed = QED(mee);
+    const double tff = TFF(mee, par);
+
+    // check if slope parameter is really high, artificially set to switch to pure QED
+    const double Lambda_sqr = std_ext::sqr(par[1]);
+    const double b = 1./Lambda_sqr;
+    double dGdm = b > 100. ? qed : qed*tff;
+
+    return dGdm*par[0];
+}
+
+
+void extract_tff(const pair<const double, const double> n_ref, const vector<pair<double, double>> signal_fits,
+                 const double max_range_tff = .8, const bool show_stats = true, const bool log_y = true)
+{
+    settings_t& settings = settings_t::get();
+
+    // values from BESIII paper (arXiv:1405.06016)
+    constexpr double gamma = .13;  // gamma from BESIII paper
+    constexpr double Lambda = .79;  // Lambda from BESIII paper
+
+    const auto q2_ranges = get_q2_ranges();
+    vector<double> q2_bin_centers, q2_bin_half_widths;
+    // get bin centers and widths in GeV
+    for (auto interval : q2_ranges) {
+        q2_bin_centers.emplace_back(interval.Center()/1000.);
+        q2_bin_half_widths.emplace_back(interval.Length()/2./1000.);
+    }
+
+    vector<double> dgdm, edgdm, rdgdm, erdgdm;
+    // start preparing values by normalizing it to the reference channel and the bin widths
+    size_t i = 0;
+    for (auto signal : signal_fits) {
+        if (i == 13)  // skip last bin (TESTING)
+            break;
+        double correction = 1.;
+        if (settings.corrections)
+            correction = 1.;  //TODO: obtain corrections
+        dgdm.emplace_back(signal.first / n_ref.first / (q2_bin_half_widths.at(i)*2.) * correction);
+        edgdm.emplace_back(signal.second / n_ref.first / (q2_bin_half_widths.at(i)*2.) * correction);
+        rdgdm.emplace_back(dgdm.back() / QED(&q2_bin_centers.at(i)));
+        erdgdm.emplace_back(edgdm.back() / QED(&q2_bin_centers.at(i)));
+        i++;
+    }
+
+    TGraphErrors* graph_dgdm = new TGraphErrors(int(dgdm.size()),&q2_bin_centers[0],&dgdm[0],
+                                                &q2_bin_half_widths[0],&edgdm[0]);
+    graph_dgdm->SetMarkerStyle(25);
+    graph_dgdm->SetMarkerSize(.6f);
+    graph_dgdm->SetMarkerColor(kRed+1);
+    graph_dgdm->SetLineColor(kRed+1);
+    TGraphErrors * graph_tff = new TGraphErrors(int(rdgdm.size()),&q2_bin_centers[0],&rdgdm[0],
+                                                &q2_bin_half_widths[0],&erdgdm[0]);
+    graph_tff->SetMarkerStyle(25);
+    graph_tff->SetMarkerSize(.6f);
+    graph_tff->SetMarkerColor(kRed+1);
+    graph_tff->SetLineColor(kRed+1);
+
+    const bool show_points_sergey = false;
+
+    TGraphErrors* graph_dgdm_sergey = nullptr;
+    TGraphErrors* graph_tff_sergey = nullptr;
+    if (show_points_sergey) {
+        if (settings.debug)
+            LOG(INFO) << "Prepare Sergey's data points";
+
+    }
+
+
+    // data points BESIII
+    vector<double> rdgdm_bes3 = {1.05,1.12,1.16,1.33,2.48,3.30,7.66,26.6};
+    vector<double> err_stat_bes3 = {0.05,0.14,0.18,0.28,0.49,0.88,2.13,7.3};
+    vector<double> err_sys_bes3 = {0.03,0.04,0.05,0.05,0.25,0.31,0.89,1.9};
+    vector<double> bin_centers_bes3 = {.05,.15,.25,.35,.45,.55,.65,.75};
+    vector<double> bin_widths_bes3 = {.05,.05,.05,.05,.05,.05,.05,.05};
+    vector<double> erdgdm_bes3;
+    for (size_t i = 0; i < rdgdm_bes3.size(); i++)
+        erdgdm_bes3.emplace_back(sqrt(std_ext::sqr(err_stat_bes3.at(i)) + std_ext::sqr(err_sys_bes3.at(i))));
+
+    // graph for BESIII data points
+    TGraphErrors *graph_bes3 = new TGraphErrors(int(rdgdm_bes3.size()),&bin_centers_bes3[0],
+                                                &rdgdm_bes3[0],&bin_widths_bes3[0],&erdgdm_bes3[0]);
+    graph_bes3->SetMarkerStyle(24);
+    graph_bes3->SetMarkerSize(.6f);
+    graph_bes3->SetMarkerColor(kGreen+1);
+    graph_bes3->SetLineColor(kGreen+1);
+
+
+    gStyle->SetStatW(.4f);
+    gStyle->SetStatH(.15f);
+    gStyle->SetStatY(1.f);
+    gStyle->SetTitleH(.06f);
+    gStyle->SetTitleW(.5f);
+    gStyle->SetTitleX(.3f);
+    gStyle->SetTitleY(.98f);
+    if (show_stats)
+        gStyle->SetOptFit(111);
+    else
+        gStyle->SetOptFit(0);
+
+
+    TF1 *f1 = new TF1("f1",dGdm,0.01,max_range_tff+.03,3);
+    f1->SetParameter(0,1.);
+    f1->SetParameter(1,Lambda);
+    f1->SetParameter(2,gamma);
+    f1->SetLineWidth(1);
+    f1->SetLineStyle(1);
+    f1->SetLineColor(kGreen+1);
+    TF1 *f2 = new TF1("f2",dGdm,0.01,max_range_tff+.03,3);
+    f2->SetParameter(0,1.);
+    f2->SetParameter(1,.001);
+    f2->SetParameter(2,.001);
+    f2->SetLineWidth(1);
+    f2->SetLineStyle(kDashed);
+    f2->SetLineColor(kBlack);
+    TF1 *f3 = new TF1("f3",TFF,0.01,max_range_tff+.03,3);
+    f3->SetParameter(0,1.);
+    f3->SetParameter(1,Lambda);
+    f3->SetParameter(2,gamma);
+    // parameter limits used earlier when just using my data points
+    f3->SetParLimits(1,.7,.9);
+    f3->SetParLimits(2,0.1,0.15);
+    //f3->FixParameter(0, 1.);
+    f3->SetParName(1, "#Lambda");
+    f3->SetParName(2, "#gamma");
+    f3->SetLineWidth(1);
+    f3->SetLineStyle(1);
+    f3->SetLineColor(kBlue);
+
+    TLine *lin = new TLine(0.,1.,max_range_tff+.03,1.);
+    lin->SetLineStyle(kDotted);
+
+    const char* XTitle = "m_{e^{+}e^{-}} [GeV/c^{2}]";
+    const char* YTitle = "d#Gamma/dm [(GeV/c^{2})^{-1}]";
+    const char* YTitle2 = "F_{#eta'}^{2}";
+
+    graph_dgdm->GetXaxis()->SetLabelSize(.05f);
+    graph_dgdm->GetYaxis()->SetLabelSize(.05f);
+    graph_dgdm->GetXaxis()->SetNdivisions(8);
+    graph_dgdm->GetYaxis()->SetNdivisions(10);
+
+    graph_dgdm->SetTitle();
+
+    graph_dgdm->GetXaxis()->SetTitle(XTitle);
+    graph_dgdm->GetXaxis()->SetTitleSize(.06f);
+    graph_dgdm->GetXaxis()->SetTitleOffset(1.1f);
+    graph_dgdm->GetYaxis()->SetTitle(YTitle);
+    graph_dgdm->GetYaxis()->SetTitleSize(.05f);
+    graph_dgdm->GetYaxis()->SetTitleOffset(1.4f);
+    graph_dgdm->GetXaxis()->SetRangeUser(0.,max_range_tff+.03);
+
+    graph_dgdm->SetMarkerStyle(23);
+    graph_dgdm->SetMarkerSize(.6f);
+
+    if (log_y)
+        graph_dgdm->SetMinimum(-0.0001);
+    else
+        graph_dgdm->SetMinimum(0.00002);
+    graph_tff->GetXaxis()->SetLabelSize(.05f);
+    graph_tff->GetYaxis()->SetLabelSize(.05f);
+    graph_tff->GetXaxis()->SetNdivisions(8);
+    graph_tff->GetYaxis()->SetNdivisions(10);
+    if (log_y) {
+        graph_tff->SetMaximum(100.);
+        graph_tff->SetMinimum(-5.);
+    }
+    else {
+        graph_tff->SetMaximum(250.);
+        graph_tff->SetMinimum(.5);
+    }
+    graph_tff->SetTitle();
+
+    graph_tff->GetXaxis()->SetTitle(XTitle);
+    graph_tff->GetXaxis()->SetTitleSize(.06f);
+    graph_tff->GetXaxis()->SetTitleOffset(1.1f);
+    graph_tff->GetYaxis()->SetTitle(YTitle2);
+    graph_tff->GetYaxis()->SetTitleSize(.05f);
+    graph_tff->GetYaxis()->SetTitleOffset(1.1f);
+    graph_tff->GetXaxis()->SetRangeUser(0.,max_range_tff+.03);
+    graph_tff->SetMarkerStyle(23);
+    graph_tff->SetMarkerSize(.6f);
+
+    TCanvas *c = new TCanvas("c1","TFF",1,1,750,400);
+    c->Divide(2,1,.01f,.01f);
+
+    const auto prepare_pad = [log_y](){
+        gPad->SetTopMargin(0.1f);
+        gPad->SetLeftMargin(0.15f);
+        gPad->SetBottomMargin(0.16f);
+        gPad->SetRightMargin(0.03f);
+        if (log_y)
+            gPad->SetLogy();
+    };
+
+    // pad showing the data points compared to dGamma/dm
+    c->cd(1);
+    prepare_pad();
+
+    graph_dgdm->Draw("APz");
+    f1->Draw("same");
+    f2->Draw("same");
+    if (graph_dgdm_sergey)
+        graph_dgdm_sergey->Draw("samePz");
+
+
+    // pad showing data points compared to TFF as well as other measurements
+    c->cd(2);
+    prepare_pad();
+
+    graph_tff->Draw("APz");
+    //f3->FixParameter(0,1.);
+    graph_tff->Fit("f3","","",0.01,max_range_tff);
+    double legend_y1 = 0.73;
+    double legend_y2 = 0.87;
+    if (show_stats) {
+        gPad->Update();
+        TPaveStats *st = dynamic_cast<TPaveStats*>(graph_tff->FindObject("stats"));
+        st->SetX1NDC(0.2);
+        st->SetX2NDC(0.7);
+        st->SetY1NDC(0.73);
+        st->SetY2NDC(0.87);
+        legend_y1 = 0.55;
+        legend_y2 = 0.7;
+    }
+    lin->Draw("same");
+    f3->Draw("same");
+    graph_bes3->Draw("samePz");
+    graph_tff->Draw("samePz");
+    if (graph_tff_sergey)
+        graph_tff_sergey->Draw("samePz");
+    double legend_x2 = graph_tff_sergey ? .5 : .4;
+    TLegend *l = new TLegend(0.2,legend_y1,legend_x2,legend_y2);
+    if (!graph_tff_sergey)
+        l->AddEntry(graph_tff, "A2 (preliminary)", "lep");
+    if (graph_tff_sergey) {
+        l->AddEntry(graph_tff_sergey, "A2, Analysis 1", "lep");
+        l->AddEntry(graph_tff, "A2, Analysis 2", "lep");
+    }
+    l->AddEntry(graph_bes3, "BESIII", "lep");
+    //l->AddEntry(f3, "A2 Fit", "l");
+    l->Draw();
+
+    save_pad(c, settings.out_dir, "tff.pdf");
+    c->Write("tff");
 }
 
 
@@ -978,9 +1348,11 @@ int main(int argc, char** argv) {
 
     auto cmd_ref = cmd.add<TCLAP::MultiSwitchArg>("r","reference","Run Reference Channel Analysis", false);
     auto cmd_ref_only = cmd.add<TCLAP::MultiSwitchArg>("","ref-only","Only Reference Channel Analysis", false);
+    auto cmd_corrections = cmd.add<TCLAP::MultiSwitchArg>("","corrections","Apply radiative corrections", false);
 
     auto cmd_input = cmd.add<TCLAP::ValueArg<string>>("i","input","ROOT input file",true,"","rootfile");
     auto cmd_mcinput = cmd.add<TCLAP::ValueArg<string>>("m","mcinput","Input for MC histograms",false,"","rootfile");
+    auto cmd_mcplot = cmd.add<TCLAP::ValueArg<string>>("p","mcplotter","Input from Plotter for MC histograms",false,"","rootfile");
     auto cmd_output = cmd.add<TCLAP::ValueArg<string>>("o","output","Output file",false,"","filename");
     auto cmd_out_dir = cmd.add<TCLAP::ValueArg<string>>("d","directory","Output directory for images/PDFs",false,"","directory");
     TCLAP::ValuesConstraintExtra<decltype(ExpConfig::Setup::GetNames())> allowedsetupnames(ExpConfig::Setup::GetNames());
@@ -1008,6 +1380,10 @@ int main(int argc, char** argv) {
     }
     if (settings.rebin)
         LOG(INFO) << "Some of the to-be-fitted histograms will be rebinned combining " << settings.rebin << " bins";
+
+    settings.corrections = cmd_corrections->getValue();
+    if (settings.corrections)
+        LOG(INFO) << "Radiative corrections for the TFF calculation will be applied";
 
     settings.out_dir = cmd_out_dir->getValue();
     if (!settings.out_dir.empty() && !fs::exists(settings.out_dir)) {
@@ -1053,6 +1429,9 @@ int main(int argc, char** argv) {
     WrapTFileInput mcinput;
     if (cmd_mcinput->isSet())
         mcinput.OpenFile(cmd_mcinput->getValue());
+    WrapTFileInput mcplot;
+    if (cmd_mcplot->isSet())
+        mcplot.OpenFile(cmd_mcplot->getValue());
 
     auto taggChRange = convert_piecewise_interval_type<int>(
                 progs::tools::parse_cmdline_ranges(std_ext::tokenize_string(cmd_EPTrange->getValue(), ",")), true);
@@ -1104,6 +1483,9 @@ int main(int argc, char** argv) {
     // change title size, especially important for RooFit since I couldn't figure out how else to change it
     gStyle->SetTitleFontSize(.07f);
 
+
+    pair<double, double> ref_fit;
+    vector<pair<double, double>> signal_fits = {};
 
     if (ref || ref_only) {
         TH1* ref;
@@ -1172,11 +1554,19 @@ int main(int argc, char** argv) {
         gPad->Modified();
         gPad->Update();
 
-        reference_fit(input, "KinFitProb > 0.01/PID E cut < 0.3 MeV", taggChRange, mcinput);
-    }
+        reference_fit(input, "KinFitProb > 0.01/PID E cut < 0.3 MeV", taggChRange, mcinput, ref_fit);
+    } else
+        ref_fit = {6.00768e+06, 59855.2};  // use default values for the fit result if reference_fit wasn't used
 
     if (!ref_only && !interrupt)
-        signal_fit(input, {}, q2_bins, mcinput);
+        signal_fit(input, {}, q2_bins, mcinput, mcplot, signal_fits);
+
+    // make sure signal fits have been obtained and calculate the TFF
+    if (signal_fits.empty())
+        LOG(WARNING) << "Signal fit was not performed, final TFF calculation will be skipped";
+    else {
+        extract_tff(ref_fit, signal_fits);
+    }
 
 
     // run TRint
